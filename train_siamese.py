@@ -126,11 +126,11 @@ class SingleMapDataset(Dataset):
 #  地图加载 & 配对生成 (独立函数)
 # ============================================================================
 
-def load_single_map(conn, map_id, map_size):
+def load_single_map(conn, map_id, map_size, map_data_table='image_maps'):
     """从数据库加载一张地图, 返回 numpy array 或 None"""
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT image_data FROM image_maps WHERE id = %s", (int(map_id),))
+        cursor.execute(f"SELECT image_data FROM {map_data_table} WHERE id = %s", (int(map_id),))
         row = cursor.fetchone()
         cursor.close()
 
@@ -273,7 +273,7 @@ def train(args):
 
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM image_maps1")
+    cursor.execute(f"SELECT id FROM {args.map_id_table}")
     map_ids = [x[0] for x in cursor.fetchall()]
     cursor.close()
     conn.close()
@@ -324,8 +324,11 @@ def train(args):
     best_loss = float('inf')
     if os.path.exists(args.save_path):
         try:
-            state = torch.load(args.save_path, map_location=device, weights_only=True)
-            model.load_state_dict(state)
+            state = torch.load(args.save_path, map_location=device, weights_only=False)
+            if isinstance(state, dict) and 'model_state_dict' in state:
+                model.load_state_dict(state['model_state_dict'])
+            else:
+                model.load_state_dict(state)
             print(f"[Train] 已加载已有模型: {args.save_path}")
         except:
             print(f"[Train] 已有模型加载失败, 从头训练")
@@ -376,7 +379,7 @@ def train(args):
             # --- 1. 加载地图 ---
             t_load = time.time()
             conn = mysql.connector.connect(**db_config)
-            sat_map = load_single_map(conn, map_id, args.map_size)
+            sat_map = load_single_map(conn, map_id, args.map_size, args.map_data_table)
             conn.close()
             load_time = time.time() - t_load
 
@@ -497,7 +500,10 @@ def train(args):
         # 保存最优
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save(model.state_dict(), args.save_path)
+            torch.save({
+                'model_type': 'lightweight' if args.lightweight else 'resnet18',
+                'model_state_dict': model.state_dict(),
+            }, args.save_path)
             print(f"  ★ 新最优模型已保存 (loss={best_loss:.6f})")
 
         # 每 10 个 epoch checkpoint
@@ -505,6 +511,7 @@ def train(args):
             ckpt_path = args.save_path.replace('.pth', f'_epoch{epoch}.pth')
             torch.save({
                 'epoch': epoch,
+                'model_type': 'lightweight' if args.lightweight else 'resnet18',
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss,
@@ -514,7 +521,10 @@ def train(args):
 
     # ---- 训练结束 ----
     total_time = time.time() - train_start
-    torch.save(model.state_dict(), args.save_path)
+    torch.save({
+        'model_type': 'lightweight' if args.lightweight else 'resnet18',
+        'model_state_dict': model.state_dict(),
+    }, args.save_path)
     print(f"\n{'=' * 60}")
     print(f"[Train] 训练完成!")
     print(f"  总耗时:   {format_time(total_time)}")
@@ -530,10 +540,12 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Siamese Pre-training (逐张地图版)')
 
-    parser.add_argument('--db-user', type=str, default='root')
-    parser.add_argument('--db-password', type=str, default='Wqw030221')
-    parser.add_argument('--db-host', type=str, default='localhost')
-    parser.add_argument('--db-name', type=str, default='senmap')
+    parser.add_argument('--db-user', type=str, default=os.getenv('UAV_DB_USER', 'root'))
+    parser.add_argument('--db-password', type=str, default=os.getenv('UAV_DB_PASSWORD', ''))
+    parser.add_argument('--db-host', type=str, default=os.getenv('UAV_DB_HOST', 'localhost'))
+    parser.add_argument('--db-name', type=str, default=os.getenv('UAV_DB_NAME', 'senmap'))
+    parser.add_argument('--map-id-table', type=str, default=os.getenv('UAV_MAP_ID_TABLE', 'image_maps'))
+    parser.add_argument('--map-data-table', type=str, default=os.getenv('UAV_MAP_DATA_TABLE', 'image_maps'))
 
     parser.add_argument('--map-size', type=int, default=3000)
     parser.add_argument('--grid-size', type=int, default=30)

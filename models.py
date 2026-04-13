@@ -242,6 +242,17 @@ class MapTransitionModel(nn.Module):
 
         return next_map
 
+    def predict_next_embedding(self, belief, state, action, map_embedding):
+        """
+        在想象阶段直接预测下一步 map embedding (隐空间动力学)。
+        使用与 forward 相同的条件干线 cond_fc，确保训练/规划共享同一动力学主干。
+        """
+        cond = self.cond_fc(torch.cat([belief, state, action, map_embedding], dim=1))
+        if hasattr(self, 'imagine_proj'):
+            delta = self.imagine_proj(cond)
+            return map_embedding + 0.1 * delta
+        return map_embedding
+
 
 # ============================================================================
 #  [公式 24-25] ObstacleForecaster: D_o
@@ -560,7 +571,8 @@ class TransitionModel(nn.Module):
             observations: Optional[torch.Tensor] = None,
             nonterminals: Optional[torch.Tensor] = None,
             semantic_features: Optional[torch.Tensor] = None,
-            map_embeddings: Optional[torch.Tensor] = None,
+            map_embeddings_prev: Optional[torch.Tensor] = None,
+            map_embeddings_curr: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -573,8 +585,8 @@ class TransitionModel(nn.Module):
             observations:        (T, B, embedding_size) — encoder 输出 e_t
             nonterminals:        (T, B, 1)
             semantic_features:   (T, B, semantic_size) — gθ 输出
-            map_embeddings:      (T, B, map_embedding_size) — E_m(M_t) 输出
-                                 训练时提供; 想象时为 None
+            map_embeddings_prev: (T, B, map_embedding_size) — 上一步 m_{t-1}, 用于 prior/GRU
+            map_embeddings_curr: (T, B, map_embedding_size) — 当前步 m_t, 用于 posterior
         Returns:
             beliefs, prior_states, prior_means, prior_std_devs,
             posterior_states, posterior_means, posterior_std_devs,
@@ -612,8 +624,8 @@ class TransitionModel(nn.Module):
 
             # --- System 1: RSSM ---
             # [公式 14] 拼接 state + action + map_embedding
-            if map_embeddings is not None:
-                map_emb = map_embeddings[t_]
+            if map_embeddings_prev is not None:
+                map_emb = map_embeddings_prev[t_]
             else:
                 map_emb = torch.zeros(B, self.map_embedding_size, device=_state.device)
 
@@ -631,7 +643,7 @@ class TransitionModel(nn.Module):
             # [公式 16] Posterior (仅训练时有 observations)
             if observations is not None:
                 # 论文公式16: q(z_t | h_t, e_t, m_t) — 使用 map_embedding
-                _map_emb_post = map_embeddings[t_] if map_embeddings is not None else \
+                _map_emb_post = map_embeddings_curr[t_] if map_embeddings_curr is not None else \
                     torch.zeros(B, self.map_embedding_size, device=_state.device)
                 hidden = self.act_fn(
                     self.fc_embed_belief_posterior(

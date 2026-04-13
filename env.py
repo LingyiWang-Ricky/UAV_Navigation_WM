@@ -79,6 +79,28 @@ class SiameseNetwork(nn.Module):
         return self.forward_one(x1), self.forward_one(x2)
 
 
+class SiameseNetworkLite(nn.Module):
+    """轻量 Siamese backbone，与 train_siamese.py 的 lightweight 版本兼容。"""
+    def __init__(self, feature_dim=128):
+        super(SiameseNetworkLite, self).__init__()
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.fc = nn.Linear(256, feature_dim)
+
+    def forward_one(self, x):
+        x = self.backbone(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+    def forward(self, x1, x2):
+        return self.forward_one(x1), self.forward_one(x2)
+
+
 # ============================================================================
 #  UAV Navigation Environment (Redesigned)
 # ============================================================================
@@ -263,8 +285,12 @@ class UAVNavigationEnv(gym.Env):
         reward_collision=-10.0,    # λ_col — 碰撞=坠毁, 中等惩罚 (terminate 本身是大惩罚)
         reward_rel_scale=1.0,      # λ_rel — 提高语义进展权重, 提供密集引导
         reward_risk_scale=0.005,     # λ_risk — 降低, 避免过度保守 (0.2×1=0.2 max/step)
+        reward_dist_scale=2.0,     # 新增: 距离势函数 shaping, 提高稳定收敛
         # --- 可选 shaping ---
         similarity_reward_scale=0.0,
+        # --- 课程学习 (仅训练模式) ---
+        start_min_grid_distance=8,
+        curriculum_warmup_episodes=300,
         # --- Siamese 相似度参数 ---
         siamese_model_path=None,
         df_max=10.0,
@@ -304,7 +330,10 @@ class UAVNavigationEnv(gym.Env):
         self.reward_collision = float(reward_collision)
         self.reward_rel_scale = float(reward_rel_scale)
         self.reward_risk_scale = float(reward_risk_scale)
+        self.reward_dist_scale = float(reward_dist_scale)
         self.similarity_reward_scale = float(similarity_reward_scale)
+        self.start_min_grid_distance = int(start_min_grid_distance)
+        self.curriculum_warmup_episodes = int(curriculum_warmup_episodes)
 
         # ---------- [论文 Section III-A] 动态障碍物参数 ----------
         self.num_obstacles = int(num_obstacles)
@@ -353,12 +382,18 @@ class UAVNavigationEnv(gym.Env):
             raise FileNotFoundError(
                 f"[UAVEnv] 必须提供已训练的 Siamese 模型, 路径无效: {siamese_model_path}. "
             )
-        self.siamese_net = SiameseNetwork(feature_dim=128)
-        state_dict = torch.load(siamese_model_path, map_location=siamese_device, weights_only=True)
+        model_blob = torch.load(siamese_model_path, map_location=siamese_device, weights_only=False)
+        if isinstance(model_blob, dict) and 'model_state_dict' in model_blob:
+            model_type = model_blob.get('model_type', 'resnet18')
+            state_dict = model_blob['model_state_dict']
+        else:
+            model_type = 'resnet18'
+            state_dict = model_blob
+        self.siamese_net = SiameseNetworkLite(feature_dim=128) if model_type == 'lightweight' else SiameseNetwork(feature_dim=128)
         self.siamese_net.load_state_dict(state_dict)
         self.siamese_net.to(siamese_device)
         self.siamese_net.eval()
-        print(f"[UAVEnv] Siamese 模型已加载: {siamese_model_path}")
+        print(f"[UAVEnv] Siamese 模型已加载: {siamese_model_path} (type={model_type})")
 
         # ---------- 地图状态 ----------
         self.satellite_map = np.zeros((self.D, self.D, 3), dtype=np.uint8)
@@ -370,17 +405,20 @@ class UAVNavigationEnv(gym.Env):
         self._is_test = False
         self._prev_image = None   # 用于观测延迟机制
         self._last_info = {}      # 用于评测读取 reach/collision
+        self._episode_rng = None
 
         # ---------- 数据库 ----------
         self.db_config = db_config
         self.db_conn = None
+        self.map_id_table = os.getenv('UAV_MAP_ID_TABLE', 'image_maps')
+        self.map_data_table = os.getenv('UAV_MAP_DATA_TABLE', self.map_id_table)
 
         if self.db_config:
             try:
                 self.db_conn = mysql.connector.connect(**self.db_config)
                 print("[UAVEnv] DB Connected.")
                 cur = self.db_conn.cursor()
-                cur.execute("SELECT id FROM image_maps1")
+                cur.execute(f"SELECT id FROM {self.map_id_table}")
                 all_ids = [x[0] for x in cur.fetchall()]
                 cur.close()
 
@@ -403,7 +441,7 @@ class UAVNavigationEnv(gym.Env):
     #  Position Generation
     # ================================================================
 
-    def _generate_random_positions(self, rng=None):
+    def _generate_random_positions(self, rng=None, min_grid_distance=None):
         """
         [改] 起终点生成: **独立随机采样**, 但要求切比雪夫网格距离 ≥ min_grid_distance.
 
@@ -425,7 +463,7 @@ class UAVNavigationEnv(gym.Env):
 
         lo = int(self.pos_margin_cells)
         hi = int(self.Ng - self.pos_margin_cells)  # exclusive
-        D_min = int(self.min_grid_distance)
+        D_min = int(self.min_grid_distance if min_grid_distance is None else min_grid_distance)
 
         usable = hi - lo
         max_possible_cheb = usable - 1  # 对角端到端的切比雪夫距离
@@ -495,7 +533,7 @@ class UAVNavigationEnv(gym.Env):
         if not self.db_conn:
             raise ConnectionError("Database is not connected! Check your DB config.")
         if not self.map_ids:
-            raise ValueError("No map IDs found in the database table 'image_maps1'.")
+            raise ValueError(f"No map IDs found in the database table '{self.map_id_table}'.")
 
         try:
             start_time = time.time()
@@ -518,7 +556,7 @@ class UAVNavigationEnv(gym.Env):
 
             # ===== 从数据库加载地图 =====
             cursor = self.db_conn.cursor()
-            cursor.execute("SELECT image_data FROM image_maps WHERE id = %s", (int(selected_id),))
+            cursor.execute(f"SELECT image_data FROM {self.map_data_table} WHERE id = %s", (int(selected_id),))
             row = cursor.fetchone()
             cursor.close()
 
@@ -653,17 +691,21 @@ class UAVNavigationEnv(gym.Env):
         self.obstacles = []
         margin = self.obstacle_rho + self.uav_rho + self.cell_size  # 安全生成距离
 
+        rng = self._episode_rng
+        _choice = rng.choice if rng is not None else np.random.choice
+        _uniform = rng.uniform if rng is not None else np.random.uniform
+
         for _ in range(self.num_obstacles):
             # 随机运动类型
-            mtype = np.random.choice(self.obstacle_motion_types)
+            mtype = _choice(self.obstacle_motion_types)
             # 随机速度方向
-            angle = np.random.uniform(0, 2 * np.pi)
-            speed = np.random.uniform(self.obstacle_speed * 0.5, self.obstacle_speed * 1.5)
+            angle = _uniform(0, 2 * np.pi)
+            speed = _uniform(self.obstacle_speed * 0.5, self.obstacle_speed * 1.5)
             v = np.array([np.cos(angle) * speed, np.sin(angle) * speed], dtype=np.float32)
 
             # 随机位置: 避开 agent/target 周围
             for _ in range(200):
-                q = np.random.uniform(self.obstacle_rho, self.D - self.obstacle_rho, size=2).astype(np.float32)
+                q = _uniform(self.obstacle_rho, self.D - self.obstacle_rho, size=2).astype(np.float32)
                 d_agent = np.linalg.norm(q - self.agent_pos)
                 d_target = np.linalg.norm(q - self.target_pos)
                 if d_agent > margin and d_target > margin:
@@ -864,9 +906,21 @@ class UAVNavigationEnv(gym.Env):
             pos_rng = np.random.RandomState(map_seed if map_seed is not None
                                             else self.fixed_position_seed)
             self.agent_pos, self.target_pos = self._generate_random_positions(rng=pos_rng)
+            self._episode_rng = np.random.RandomState((map_seed if map_seed is not None else self.fixed_position_seed) + 1000003)
         else:
             # [论文 V-A] 训练模式: 每 episode 随机采样新的 start-goal pair
-            self.agent_pos, self.target_pos = self._generate_random_positions(rng=None)
+            if self.curriculum_warmup_episodes > 0:
+                progress = min(1.0, self.episode_counter / float(self.curriculum_warmup_episodes))
+                cur_min_dist = int(round(
+                    self.start_min_grid_distance +
+                    (self.min_grid_distance - self.start_min_grid_distance) * progress
+                ))
+            else:
+                cur_min_dist = self.min_grid_distance
+            self.agent_pos, self.target_pos = self._generate_random_positions(
+                rng=None, min_grid_distance=cur_min_dist
+            )
+            self._episode_rng = None
 
         self.init_dist = float(np.linalg.norm(self.agent_pos - self.target_pos))
         self.steps = 0
@@ -890,6 +944,8 @@ class UAVNavigationEnv(gym.Env):
         self._spawn_obstacles()
         self._refresh_dynamic_channels()
         self._update_map(self.agent_pos, True)
+        gx0, gy0 = self._pos_to_grid(self.agent_pos)
+        self.semantic_map[self.CH_REL, gx0, gy0] = self._compute_similarity(self.agent_pos)
 
         return self._get_obs(), {}
 
@@ -914,6 +970,7 @@ class UAVNavigationEnv(gym.Env):
         a_idx = int(np.clip(a_idx, 0, 7))
         direction = self._dir8[a_idx]
         new_pos = self.agent_pos + direction * self.cell_size
+        old_goal_dist = float(np.linalg.norm(self.agent_pos - self.target_pos))
 
         reward = 0.0
         terminated = False
@@ -968,6 +1025,14 @@ class UAVNavigationEnv(gym.Env):
                 mrel_new_safe = max(0.0, float(vs_new))
                 delta_s = mrel_new_safe - mrel_old_safe
                 reward += self.reward_rel_scale * delta_s
+
+            # 额外稳定项: 距离势函数 shaping (potential-based)
+            # 鼓励“向目标靠近”的动作，抑制随机游走导致的稀疏成功尖峰。
+            if self.reward_dist_scale > 0.0:
+                new_goal_dist = float(np.linalg.norm(new_pos - self.target_pos))
+                progress = (old_goal_dist - new_goal_dist) / max(self.init_dist, 1e-6)
+                progress = float(np.clip(progress, -1.0, 1.0))
+                reward += self.reward_dist_scale * progress
 
             # ===== 8. 预测风险惩罚 χ_t (公式 28) =====
             # 注: env 层面用静止假设近似 (UAV 不知道 policy 的未来动作),
@@ -1174,13 +1239,16 @@ class GymEnv:
 def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
     if env == 'UAV-v0':
         db_cfg = {
-            'user': 'root', 'password': 'Wqw030221',
-            'host': 'localhost', 'database': 'senmap',
+            'user': os.getenv('UAV_DB_USER', 'root'),
+            'password': os.getenv('UAV_DB_PASSWORD', ''),
+            'host': os.getenv('UAV_DB_HOST', 'localhost'),
+            'database': os.getenv('UAV_DB_NAME', 'senmap'),
             'raise_on_warnings': True
         }
+        siamese_model_path = os.getenv('UAV_SIAMESE_MODEL_PATH', 'siamese_model.pth')
         return UAVEnvWrapper(
             UAVNavigationEnv(max_steps=max_episode_length, db_config=db_cfg,
-                             siamese_model_path='siamese_model.pth'),
+                             siamese_model_path=siamese_model_path),
             bit_depth,
             action_repeat=action_repeat,
         )
