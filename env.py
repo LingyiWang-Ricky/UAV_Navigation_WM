@@ -285,8 +285,12 @@ class UAVNavigationEnv(gym.Env):
         reward_collision=-10.0,    # λ_col — 碰撞=坠毁, 中等惩罚 (terminate 本身是大惩罚)
         reward_rel_scale=1.0,      # λ_rel — 提高语义进展权重, 提供密集引导
         reward_risk_scale=0.005,     # λ_risk — 降低, 避免过度保守 (0.2×1=0.2 max/step)
+        reward_dist_scale=2.0,     # 新增: 距离势函数 shaping, 提高稳定收敛
         # --- 可选 shaping ---
         similarity_reward_scale=0.0,
+        # --- 课程学习 (仅训练模式) ---
+        start_min_grid_distance=8,
+        curriculum_warmup_episodes=300,
         # --- Siamese 相似度参数 ---
         siamese_model_path=None,
         df_max=10.0,
@@ -326,7 +330,10 @@ class UAVNavigationEnv(gym.Env):
         self.reward_collision = float(reward_collision)
         self.reward_rel_scale = float(reward_rel_scale)
         self.reward_risk_scale = float(reward_risk_scale)
+        self.reward_dist_scale = float(reward_dist_scale)
         self.similarity_reward_scale = float(similarity_reward_scale)
+        self.start_min_grid_distance = int(start_min_grid_distance)
+        self.curriculum_warmup_episodes = int(curriculum_warmup_episodes)
 
         # ---------- [论文 Section III-A] 动态障碍物参数 ----------
         self.num_obstacles = int(num_obstacles)
@@ -434,7 +441,7 @@ class UAVNavigationEnv(gym.Env):
     #  Position Generation
     # ================================================================
 
-    def _generate_random_positions(self, rng=None):
+    def _generate_random_positions(self, rng=None, min_grid_distance=None):
         """
         [改] 起终点生成: **独立随机采样**, 但要求切比雪夫网格距离 ≥ min_grid_distance.
 
@@ -456,7 +463,7 @@ class UAVNavigationEnv(gym.Env):
 
         lo = int(self.pos_margin_cells)
         hi = int(self.Ng - self.pos_margin_cells)  # exclusive
-        D_min = int(self.min_grid_distance)
+        D_min = int(self.min_grid_distance if min_grid_distance is None else min_grid_distance)
 
         usable = hi - lo
         max_possible_cheb = usable - 1  # 对角端到端的切比雪夫距离
@@ -902,7 +909,17 @@ class UAVNavigationEnv(gym.Env):
             self._episode_rng = np.random.RandomState((map_seed if map_seed is not None else self.fixed_position_seed) + 1000003)
         else:
             # [论文 V-A] 训练模式: 每 episode 随机采样新的 start-goal pair
-            self.agent_pos, self.target_pos = self._generate_random_positions(rng=None)
+            if self.curriculum_warmup_episodes > 0:
+                progress = min(1.0, self.episode_counter / float(self.curriculum_warmup_episodes))
+                cur_min_dist = int(round(
+                    self.start_min_grid_distance +
+                    (self.min_grid_distance - self.start_min_grid_distance) * progress
+                ))
+            else:
+                cur_min_dist = self.min_grid_distance
+            self.agent_pos, self.target_pos = self._generate_random_positions(
+                rng=None, min_grid_distance=cur_min_dist
+            )
             self._episode_rng = None
 
         self.init_dist = float(np.linalg.norm(self.agent_pos - self.target_pos))
@@ -953,6 +970,7 @@ class UAVNavigationEnv(gym.Env):
         a_idx = int(np.clip(a_idx, 0, 7))
         direction = self._dir8[a_idx]
         new_pos = self.agent_pos + direction * self.cell_size
+        old_goal_dist = float(np.linalg.norm(self.agent_pos - self.target_pos))
 
         reward = 0.0
         terminated = False
@@ -1007,6 +1025,14 @@ class UAVNavigationEnv(gym.Env):
                 mrel_new_safe = max(0.0, float(vs_new))
                 delta_s = mrel_new_safe - mrel_old_safe
                 reward += self.reward_rel_scale * delta_s
+
+            # 额外稳定项: 距离势函数 shaping (potential-based)
+            # 鼓励“向目标靠近”的动作，抑制随机游走导致的稀疏成功尖峰。
+            if self.reward_dist_scale > 0.0:
+                new_goal_dist = float(np.linalg.norm(new_pos - self.target_pos))
+                progress = (old_goal_dist - new_goal_dist) / max(self.init_dist, 1e-6)
+                progress = float(np.clip(progress, -1.0, 1.0))
+                reward += self.reward_dist_scale * progress
 
             # ===== 8. 预测风险惩罚 χ_t (公式 28) =====
             # 注: env 层面用静止假设近似 (UAV 不知道 policy 的未来动作),
