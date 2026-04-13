@@ -117,7 +117,6 @@ parser.add_argument('--lambda-c', type=float, default=1.0, help='Weight for cont
 parser.add_argument('--lambda-map', type=float, default=10.0, help='Weight for map prediction loss (公式40)')
 parser.add_argument('--lambda-occ', type=float, default=5.0, help='Weight for occupancy loss (公式41)')
 parser.add_argument('--lambda-flow', type=float, default=2.0, help='Weight for motion flow loss (公式42)')
-parser.add_argument('--lambda-trk', type=float, default=1.0, help='Weight for trajectory loss (公式43)')
 parser.add_argument('--forecast-horizon', type=int, default=5, help='Obstacle forecasting K steps')
 parser.add_argument('--encode-batch', type=int, default=100, metavar='EB',
                     help='Mini-batch size for encoder forward')
@@ -400,6 +399,10 @@ def update_belief_and_act(
     - 传入 map_encoder 和 current_map_embedding
     - Actor 接收 map_embedding
     """
+    prev_map_embedding = current_map_embedding
+    if prev_map_embedding is None:
+        prev_map_embedding = torch.zeros(1, args.map_embedding_size, device=args.device)
+
     if isinstance(observation, dict):
         obs_img = observation['image'].to(args.device)
         obs_tgt_img = observation['target'].to(args.device)
@@ -427,15 +430,14 @@ def update_belief_and_act(
             if obs_sem_map.dim() == 3:
                 obs_sem_map = obs_sem_map.unsqueeze(0)
             current_map_embedding = map_encoder(obs_sem_map)
-        elif current_map_embedding is None:
-            current_map_embedding = torch.zeros(1, args.map_embedding_size, device=args.device)
+        else:
+            current_map_embedding = prev_map_embedding
     else:
         obs_input = observation.to(args.device)
         full_output = encoder(obs_input)
         embed = full_output[0] if isinstance(full_output, tuple) else full_output
         sem_feat = None
-        if current_map_embedding is None:
-            current_map_embedding = torch.zeros(1, args.map_embedding_size, device=args.device)
+        current_map_embedding = prev_map_embedding
 
     # TransitionModel
     belief, _, _, _, posterior_state, _, _, next_semantic_state = transition_model(
@@ -445,7 +447,8 @@ def update_belief_and_act(
         semantic_state,
         embed.unsqueeze(dim=0),
         semantic_features=sem_feat.unsqueeze(dim=0) if sem_feat is not None else None,
-        map_embeddings=current_map_embedding.unsqueeze(dim=0),
+        map_embeddings_prev=prev_map_embedding.unsqueeze(dim=0),
+        map_embeddings_curr=current_map_embedding.unsqueeze(dim=0),
     )
 
     belief = belief.squeeze(dim=0)
@@ -581,7 +584,8 @@ for episode in tqdm(
             del map_emb_chunks
             full_map_emb = flat_map_emb.view(T, B, -1)
             del flat_map_emb
-            map_emb_for_tm = full_map_emb[:-1]
+            map_emb_prev_for_tm = full_map_emb[:-1]
+            map_emb_curr_for_tm = full_map_emb[1:]
             map_emb_for_loss = full_map_emb[1:]
 
             # DifferentiableMapUpdater 输入 — 在 CPU, loss 阶段再按块搬
@@ -612,7 +616,8 @@ for episode in tqdm(
             target_obs_cpu = obs_tensor[1:]  # 已在 GPU
             loss_curr_feat = None
             sem_feat_for_tm = None
-            map_emb_for_tm = None
+            map_emb_prev_for_tm = None
+            map_emb_curr_for_tm = None
             map_emb_for_loss = None
             target_maps_cpu = None
             source_maps_cpu = None
@@ -636,7 +641,8 @@ for episode in tqdm(
         ) = transition_model(
             init_state, actions[:-1], init_belief, init_semantic, embed, nonterminals[:-1],
             semantic_features=sem_feat_for_tm,
-            map_embeddings=map_emb_for_tm,
+            map_embeddings_prev=map_emb_prev_for_tm,
+            map_embeddings_curr=map_emb_curr_for_tm,
         )
 
         # [NaN 安全] 检测 TransitionModel 输出是否包含 NaN
@@ -661,9 +667,9 @@ for episode in tqdm(
         # 而 TransitionModel 输入用 m_{t-1}. 二者不同！
         if map_emb_for_loss is not None:
             flat_map_emb_loss = map_emb_for_loss.view(T_loss * B_loss, -1)
-        elif map_emb_for_tm is not None:
+        elif map_emb_prev_for_tm is not None:
             # fallback for non-UAV (不应触发)
-            flat_map_emb_loss = map_emb_for_tm.view(T_loss * B_loss, -1)
+            flat_map_emb_loss = map_emb_prev_for_tm.view(T_loss * B_loss, -1)
         else:
             flat_map_emb_loss = None
 
@@ -765,7 +771,7 @@ for episode in tqdm(
         # source = M_t = obs_sem_map[1:-1] (M_1..M_{T-2}), target = M_{t+1} = obs_sem_map[2:] (M_2..M_{T-1})
         # 注意: 因为 beliefs 有 T-1 步但 actions[1:] 只有 T-1 步, obs_sem_map[1:-1] 有 T-2 步,
         #       所以需要截断 beliefs 和 posterior_states 到前 T-2 步
-        if target_maps_cpu is not None and map_emb_for_tm is not None and full_map_emb is not None:
+        if target_maps_cpu is not None and map_emb_prev_for_tm is not None and full_map_emb is not None:
             # 源地图 M_t (t=1..T-2), 目标 M_{t+1} (t=2..T-1)
             src_maps_cpu = obs_sem_map[1:-1]   # (T-2, B, 6, 30, 30) CPU
             tgt_maps_cpu = obs_sem_map[2:]     # (T-2, B, 6, 30, 30) CPU
@@ -922,8 +928,8 @@ for episode in tqdm(
             actor_semantics = semantic_states.detach()
             if map_emb_for_loss is not None:
                 actor_map_emb = map_emb_for_loss.detach()
-            elif map_emb_for_tm is not None:
-                actor_map_emb = map_emb_for_tm.detach()
+            elif map_emb_prev_for_tm is not None:
+                actor_map_emb = map_emb_prev_for_tm.detach()
             else:
                 actor_map_emb = torch.zeros(
                     *actor_beliefs.shape[:2], args.map_embedding_size, device=args.device
@@ -932,14 +938,14 @@ for episode in tqdm(
         # [OOM 修复] 释放世界模型前向中间变量
         del beliefs, prior_states, prior_means, prior_std_devs
         del posterior_states, posterior_means, posterior_std_devs, semantic_states
-        del embed, sem_feat_for_tm, map_emb_for_tm, map_emb_for_loss
+        del embed, sem_feat_for_tm, map_emb_prev_for_tm, map_emb_curr_for_tm, map_emb_for_loss
         torch.cuda.empty_cache()
 
         with FreezeParameters(model_modules):
             # imagine_ahead 内部调用 TransitionModel (GRU), 不能用 autocast
             imagination_traj = imagine_ahead(
                 actor_states, actor_beliefs, actor_semantics, actor_map_emb,
-                actor_model, transition_model, map_encoder, map_transition_model,
+                actor_model, transition_model, map_transition_model,
                 args.planning_horizon,
             )
 
@@ -1226,7 +1232,7 @@ for episode in tqdm(
                 pbar.close()
                 break
 
-        metrics['steps'].append(t + metrics['steps'][-1])
+        metrics['steps'].append((t + 1) * args.action_repeat + metrics['steps'][-1])
         metrics['episodes'].append(episode)
         metrics['train_rewards'].append(total_reward)
         lineplot(
