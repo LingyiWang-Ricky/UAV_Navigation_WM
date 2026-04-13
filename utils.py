@@ -43,7 +43,6 @@ def imagine_ahead(
     prev_map_embedding,
     policy,
     transition_model,
-    map_encoder,
     map_transition_model,
     planning_horizon=12,
 ):
@@ -67,7 +66,6 @@ def imagine_ahead(
         prev_map_embedding:  (1, B*T_chunk, map_embedding_size)
         policy:              ActorModel
         transition_model:    TransitionModel
-        map_encoder:         MapEncoder (可选, 若 map_transition_model 在隐空间操作)
         map_transition_model: MapTransitionModel
         planning_horizon:    int
 
@@ -113,7 +111,7 @@ def imagine_ahead(
             observations=None,
             nonterminals=None,
             semantic_features=None,
-            map_embeddings=current_map_embedding.unsqueeze(0),  # (1, N, map_emb_size)
+            map_embeddings_prev=current_map_embedding.unsqueeze(0),  # (1, N, map_emb_size)
         )
 
         current_belief = output[0][0]            # beliefs[0]
@@ -127,9 +125,8 @@ def imagine_ahead(
         # 但想象中我们没有完整地图. 这里用一个简化方案:
         # 通过 MLP 从 (belief, state, action, map_embedding) 预测下一步 map_embedding
         # 这等价于将 T_ω 和 E_m 合并为一个隐空间映射.
-        current_map_embedding = _imagine_map_embedding(
-            current_belief, current_state, _action, current_map_embedding,
-            map_transition_model
+        current_map_embedding = map_transition_model.predict_next_embedding(
+            current_belief, current_state, _action, current_map_embedding
         )
 
         beliefs[t] = current_belief
@@ -148,32 +145,6 @@ def imagine_ahead(
         torch.stack(map_embeddings),
         torch.stack(actions),
     )
-
-
-def _imagine_map_embedding(belief, state, action, map_embedding, map_transition_model):
-    """
-    在想象中预测下一步的 map_embedding.
-
-    由于想象中不持有完整 6×30×30 地图, 使用 MapTransitionModel
-    的隐空间近似: 用同样的条件向量直接预测 map_embedding 的变化.
-
-    如果完整地图可用 (例如通过小型生成网络), 可以:
-        M̃_{t+1} = map_transition_model(M̃_t, belief, state, action, map_embedding)
-        m̃_{t+1} = map_encoder(M̃_{t+1})
-    """
-    # 使用 map_transition_model 的 cond_fc 作为隐空间预测器
-    cond = torch.cat([belief, state, action, map_embedding], dim=1)
-    cond_feat = map_transition_model.cond_fc(cond)
-
-    # 简单残差: 新的 map_embedding = old + delta
-    # 从 cond_feat (512) 映射到 map_embedding_size
-    # 需要一个额外的投影层 (在 MapTransitionModel 中添加)
-    if hasattr(map_transition_model, 'imagine_proj'):
-        delta = map_transition_model.imagine_proj(cond_feat)
-        return map_embedding + 0.1 * delta  # 小步残差
-    else:
-        # Fallback: 直接使用旧的 map_embedding (不更新)
-        return map_embedding
 
 
 def lambda_return(imged_reward, value_pred, bootstrap, cont_pred=None,
